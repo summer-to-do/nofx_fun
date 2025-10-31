@@ -6,8 +6,10 @@ import (
 	"io/ioutil"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Data 市场数据结构
@@ -20,15 +22,61 @@ type Data struct {
 	CurrentMACD       float64
 	CurrentRSI7       float64
 	OpenInterest      *OIData
-	FundingRate       float64
+	Funding           *FundingData
+	Timeframes        map[string]*TimeframeMetrics
+	Microstructure    *MicrostructureData
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
 }
 
+// FundingData 资金费率与斜率数据
+type FundingData struct {
+	Rate       float64
+	Slope      float64
+	NextTimeMs int64
+}
+
 // OIData Open Interest数据
 type OIData struct {
-	Latest  float64
-	Average float64
+	Latest        float64
+	Average       float64
+	Delta5m       float64
+	Delta15m      float64
+	Delta1h       float64
+	Delta4h       float64
+	PriceDelta5m  float64
+	PriceDelta15m float64
+	PriceDelta1h  float64
+	PriceDelta4h  float64
+	TimestampMs   int64
+}
+
+// TimeframeMetrics 多周期指标
+type TimeframeMetrics struct {
+	Interval       string
+	Close          float64
+	RSI7           float64
+	RSI14          float64
+	MACD           float64
+	EMA20          float64
+	EMA60          float64
+	BollingerWidth float64
+	ATR14          float64
+	RealizedVol20  float64
+	CurrentVolume  float64
+	AverageVolume  float64
+}
+
+// MicrostructureData 微结构指标
+type MicrostructureData struct {
+	CVD1m      float64
+	CVD3m      float64
+	CVD15m     float64
+	OFI1m      float64
+	OFI3m      float64
+	OFI15m     float64
+	OBI10      float64
+	MicroPrice float64
 }
 
 // IntradayData 日内数据(3分钟间隔)
@@ -68,58 +116,54 @@ func Get(symbol string) (*Data, error) {
 	// 标准化symbol
 	symbol = Normalize(symbol)
 
-	// 获取3分钟K线数据 (最近10个)
-	klines3m, err := getKlines(symbol, "3m", 40) // 多获取一些用于计算
-	if err != nil {
-		return nil, fmt.Errorf("获取3分钟K线失败: %v", err)
+	intervals := []string{"1m", "3m", "15m", "1h", "4h"}
+	klinesByInterval := make(map[string][]Kline, len(intervals))
+
+	for _, interval := range intervals {
+		limit := 200
+		if interval == "4h" {
+			limit = 120
+		}
+		klines, err := getKlines(symbol, interval, limit)
+		if err != nil {
+			return nil, fmt.Errorf("获取%s K线失败: %v", interval, err)
+		}
+		klinesByInterval[interval] = klines
 	}
 
-	// 获取4小时K线数据 (最近10个)
-	klines4h, err := getKlines(symbol, "4h", 60) // 多获取用于计算指标
-	if err != nil {
-		return nil, fmt.Errorf("获取4小时K线失败: %v", err)
-	}
-
-	// 计算当前指标 (基于3分钟最新数据)
+	// 基准使用3分钟周期
+	klines3m := klinesByInterval["3m"]
 	currentPrice := klines3m[len(klines3m)-1].Close
-	currentEMA20 := calculateEMA(klines3m, 20)
-	currentMACD := calculateMACD(klines3m)
-	currentRSI7 := calculateRSI(klines3m, 7)
 
-	// 计算价格变化百分比
-	// 1小时价格变化 = 20个3分钟K线前的价格
-	priceChange1h := 0.0
-	if len(klines3m) >= 21 { // 至少需要21根K线 (当前 + 20根前)
-		price1hAgo := klines3m[len(klines3m)-21].Close
-		if price1hAgo > 0 {
-			priceChange1h = ((currentPrice - price1hAgo) / price1hAgo) * 100
-		}
+	timeframeMetrics := make(map[string]*TimeframeMetrics, len(intervals))
+	for _, interval := range intervals {
+		metrics := calculateTimeframeMetrics(interval, klinesByInterval[interval])
+		timeframeMetrics[interval] = metrics
 	}
 
-	// 4小时价格变化 = 1个4小时K线前的价格
-	priceChange4h := 0.0
-	if len(klines4h) >= 2 {
-		price4hAgo := klines4h[len(klines4h)-2].Close
-		if price4hAgo > 0 {
-			priceChange4h = ((currentPrice - price4hAgo) / price4hAgo) * 100
-		}
-	}
+	currentEMA20 := timeframeMetrics["3m"].EMA20
+	currentMACD := timeframeMetrics["3m"].MACD
+	currentRSI7 := timeframeMetrics["3m"].RSI7
 
-	// 获取OI数据
-	oiData, err := getOpenInterestData(symbol)
+	priceChange1h := percentageChangeFromSeries(klinesByInterval["1m"], 60)
+	priceChange4h := percentageChangeFromSeries(klinesByInterval["1h"], 4)
+
+	oiData, err := getOpenInterestData(symbol,
+		klinesByInterval["1m"],
+		klinesByInterval["15m"],
+		klinesByInterval["1h"],
+		klinesByInterval["4h"],
+	)
 	if err != nil {
-		// OI失败不影响整体,使用默认值
-		oiData = &OIData{Latest: 0, Average: 0}
+		oiData = &OIData{}
 	}
 
-	// 获取Funding Rate
-	fundingRate, _ := getFundingRate(symbol)
+	fundingData, _ := getFundingData(symbol)
 
-	// 计算日内系列数据
+	microstructure := getMicrostructureData(symbol)
+
 	intradayData := calculateIntradaySeries(klines3m)
-
-	// 计算长期数据
-	longerTermData := calculateLongerTermData(klines4h)
+	longerTermData := calculateLongerTermData(klinesByInterval["4h"])
 
 	return &Data{
 		Symbol:            symbol,
@@ -130,7 +174,9 @@ func Get(symbol string) (*Data, error) {
 		CurrentMACD:       currentMACD,
 		CurrentRSI7:       currentRSI7,
 		OpenInterest:      oiData,
-		FundingRate:       fundingRate,
+		Funding:           fundingData,
+		Timeframes:        timeframeMetrics,
+		Microstructure:    microstructure,
 		IntradaySeries:    intradayData,
 		LongerTermContext: longerTermData,
 	}, nil
@@ -295,6 +341,152 @@ func calculateATR(klines []Kline, period int) float64 {
 	return atr
 }
 
+func calculateBollingerWidth(klines []Kline, period int, multiplier float64) float64 {
+	if len(klines) < period {
+		return 0
+	}
+
+	closes := make([]float64, period)
+	for i := 0; i < period; i++ {
+		closes[i] = klines[len(klines)-period+i].Close
+	}
+
+	mean := 0.0
+	for _, v := range closes {
+		mean += v
+	}
+	mean /= float64(period)
+
+	variance := 0.0
+	for _, v := range closes {
+		diff := v - mean
+		variance += diff * diff
+	}
+	variance /= float64(period)
+
+	stddev := math.Sqrt(variance)
+	if mean == 0 {
+		return 0
+	}
+
+	upper := mean + multiplier*stddev
+	lower := mean - multiplier*stddev
+	width := (upper - lower) / mean
+	return width
+}
+
+func calculateRealizedVol(klines []Kline, period int) float64 {
+	if len(klines) <= period {
+		return 0
+	}
+
+	returns := make([]float64, 0, period)
+	for i := len(klines) - period; i < len(klines); i++ {
+		if i == 0 {
+			continue
+		}
+		prev := klines[i-1].Close
+		if prev <= 0 {
+			continue
+		}
+		r := math.Log(klines[i].Close / prev)
+		returns = append(returns, r)
+	}
+
+	if len(returns) == 0 {
+		return 0
+	}
+
+	mean := 0.0
+	for _, v := range returns {
+		mean += v
+	}
+	mean /= float64(len(returns))
+
+	variance := 0.0
+	for _, v := range returns {
+		diff := v - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(returns))
+
+	return math.Sqrt(variance)
+}
+
+func calculateAverageVolume(klines []Kline, period int) (float64, float64) {
+	if len(klines) == 0 {
+		return 0, 0
+	}
+
+	current := klines[len(klines)-1].Volume
+
+	if len(klines) < period {
+		sum := 0.0
+		for _, k := range klines {
+			sum += k.Volume
+		}
+		return current, sum / float64(len(klines))
+	}
+
+	sum := 0.0
+	for i := len(klines) - period; i < len(klines); i++ {
+		sum += klines[i].Volume
+	}
+
+	return current, sum / float64(period)
+}
+
+func calculateTimeframeMetrics(interval string, klines []Kline) *TimeframeMetrics {
+	metrics := &TimeframeMetrics{Interval: interval}
+	if len(klines) == 0 {
+		return metrics
+	}
+
+	metrics.Close = klines[len(klines)-1].Close
+	metrics.RSI7 = calculateRSI(klines, 7)
+	metrics.RSI14 = calculateRSI(klines, 14)
+	metrics.MACD = calculateMACD(klines)
+	metrics.EMA20 = calculateEMA(klines, 20)
+	metrics.EMA60 = calculateEMA(klines, 60)
+	metrics.BollingerWidth = calculateBollingerWidth(klines, 20, 2)
+	metrics.ATR14 = calculateATR(klines, 14)
+	metrics.RealizedVol20 = calculateRealizedVol(klines, 20)
+	metrics.CurrentVolume, metrics.AverageVolume = calculateAverageVolume(klines, 20)
+	return metrics
+}
+
+func percentageChangeFromSeries(klines []Kline, barsBack int) float64 {
+	if len(klines) == 0 || barsBack <= 0 {
+		return 0
+	}
+
+	if len(klines) <= barsBack {
+		return 0
+	}
+
+	latest := klines[len(klines)-1].Close
+	reference := klines[len(klines)-1-barsBack].Close
+	if reference == 0 {
+		return 0
+	}
+
+	return ((latest - reference) / reference) * 100
+}
+
+func priceDeltaFromKlines(klines []Kline, barsBack int) float64 {
+	if len(klines) == 0 || barsBack <= 0 {
+		return 0
+	}
+
+	if len(klines) <= barsBack {
+		return 0
+	}
+
+	latest := klines[len(klines)-1].Close
+	reference := klines[len(klines)-1-barsBack].Close
+	return latest - reference
+}
+
 // calculateIntradaySeries 计算日内系列数据
 func calculateIntradaySeries(klines []Kline) *IntradayData {
 	data := &IntradayData{
@@ -387,18 +579,72 @@ func calculateLongerTermData(klines []Kline) *LongerTermData {
 }
 
 // getOpenInterestData 获取OI数据
-func getOpenInterestData(symbol string) (*OIData, error) {
+type oiHistoryPoint struct {
+	Value     float64
+	Timestamp int64
+}
+
+func getOpenInterestData(symbol string, klines1m, klines15m, klines1h, klines4h []Kline) (*OIData, error) {
+	latest, ts, err := getLatestOpenInterest(symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	history5m, _ := getOpenInterestHistory(symbol, "5m", 20)
+	history15m, _ := getOpenInterestHistory(symbol, "15m", 20)
+	history1h, _ := getOpenInterestHistory(symbol, "1h", 20)
+	history4h, _ := getOpenInterestHistory(symbol, "4h", 20)
+
+	avg := latest
+	if len(history4h) > 0 {
+		sum := 0.0
+		for _, pt := range history4h {
+			sum += pt.Value
+		}
+		avg = sum / float64(len(history4h))
+	}
+
+	data := &OIData{
+		Latest:      latest,
+		Average:     avg,
+		TimestampMs: ts,
+	}
+
+	if len(history5m) >= 2 {
+		data.Delta5m = history5m[len(history5m)-1].Value - history5m[len(history5m)-2].Value
+		data.PriceDelta5m = priceDeltaFromKlines(klines1m, 5)
+	}
+
+	if len(history15m) >= 2 {
+		data.Delta15m = history15m[len(history15m)-1].Value - history15m[len(history15m)-2].Value
+		data.PriceDelta15m = priceDeltaFromKlines(klines15m, 1)
+	}
+
+	if len(history1h) >= 2 {
+		data.Delta1h = history1h[len(history1h)-1].Value - history1h[len(history1h)-2].Value
+		data.PriceDelta1h = priceDeltaFromKlines(klines1h, 1)
+	}
+
+	if len(history4h) >= 2 {
+		data.Delta4h = history4h[len(history4h)-1].Value - history4h[len(history4h)-2].Value
+		data.PriceDelta4h = priceDeltaFromKlines(klines4h, 1)
+	}
+
+	return data, nil
+}
+
+func getLatestOpenInterest(symbol string) (float64, int64, error) {
 	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 
 	var result struct {
@@ -408,48 +654,151 @@ func getOpenInterestData(symbol string) (*OIData, error) {
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 
-	oi, _ := strconv.ParseFloat(result.OpenInterest, 64)
+	oi, err := strconv.ParseFloat(result.OpenInterest, 64)
+	if err != nil {
+		return 0, 0, err
+	}
 
-	return &OIData{
-		Latest:  oi,
-		Average: oi * 0.999, // 近似平均值
-	}, nil
+	return oi, result.Time, nil
 }
 
-// getFundingRate 获取资金费率
-func getFundingRate(symbol string) (float64, error) {
-	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
+func getOpenInterestHistory(symbol, period string, limit int) ([]oiHistoryPoint, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/futures/data/openInterestHist?symbol=%s&period=%s&limit=%d", symbol, period, limit)
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return 0, err
+		return nil, err
+	}
+
+	var raw []struct {
+		Symbol          string `json:"symbol"`
+		SumOpenInterest string `json:"sumOpenInterest"`
+		Timestamp       int64  `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	points := make([]oiHistoryPoint, 0, len(raw))
+	for _, item := range raw {
+		value, err := strconv.ParseFloat(item.SumOpenInterest, 64)
+		if err != nil {
+			continue
+		}
+		points = append(points, oiHistoryPoint{Value: value, Timestamp: item.Timestamp})
+	}
+
+	sort.Slice(points, func(i, j int) bool {
+		return points[i].Timestamp < points[j].Timestamp
+	})
+
+	return points, nil
+}
+
+// getFundingData 获取资金费率及变化斜率
+type fundingRatePoint struct {
+	Rate      float64
+	Timestamp int64
+}
+
+func getFundingData(symbol string) (*FundingData, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
 	var result struct {
 		Symbol          string `json:"symbol"`
-		MarkPrice       string `json:"markPrice"`
-		IndexPrice      string `json:"indexPrice"`
 		LastFundingRate string `json:"lastFundingRate"`
 		NextFundingTime int64  `json:"nextFundingTime"`
-		InterestRate    string `json:"interestRate"`
-		Time            int64  `json:"time"`
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	rate, _ := strconv.ParseFloat(result.LastFundingRate, 64)
-	return rate, nil
+	rate, err := strconv.ParseFloat(result.LastFundingRate, 64)
+	if err != nil {
+		rate = 0
+	}
+
+	history, err := getFundingRateHistory(symbol, 8)
+	if err != nil {
+		history = nil
+	}
+
+	slope := 0.0
+	if len(history) >= 2 {
+		first := history[0]
+		last := history[len(history)-1]
+		duration := float64(last.Timestamp-first.Timestamp) / float64(time.Hour/time.Millisecond)
+		if duration != 0 {
+			slope = (last.Rate - first.Rate) / duration
+		}
+	}
+
+	return &FundingData{
+		Rate:       rate,
+		Slope:      slope,
+		NextTimeMs: result.NextFundingTime,
+	}, nil
+}
+
+func getFundingRateHistory(symbol string, limit int) ([]fundingRatePoint, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/fundingRate?symbol=%s&limit=%d", symbol, limit)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw []struct {
+		FundingRate string `json:"fundingRate"`
+		FundingTime int64  `json:"fundingTime"`
+	}
+
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	points := make([]fundingRatePoint, 0, len(raw))
+	for _, item := range raw {
+		rate, err := strconv.ParseFloat(item.FundingRate, 64)
+		if err != nil {
+			continue
+		}
+		points = append(points, fundingRatePoint{Rate: rate, Timestamp: item.FundingTime})
+	}
+
+	sort.Slice(points, func(i, j int) bool {
+		return points[i].Timestamp < points[j].Timestamp
+	})
+
+	return points, nil
 }
 
 // Format 格式化输出市场数据
@@ -467,7 +816,23 @@ func Format(data *Data) string {
 			data.OpenInterest.Latest, data.OpenInterest.Average))
 	}
 
-	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
+	if data.Funding != nil {
+		sb.WriteString(fmt.Sprintf("Funding Rate: %.2e | Slope (per hour): %.2e | Next: %d\n\n",
+			data.Funding.Rate, data.Funding.Slope, data.Funding.NextTimeMs))
+	}
+
+	if data.OpenInterest != nil {
+		sb.WriteString(fmt.Sprintf("OI Δ (5m/15m/1h/4h): %.2f / %.2f / %.2f / %.2f | Price Δ: %.4f / %.4f / %.4f / %.4f\n\n",
+			data.OpenInterest.Delta5m, data.OpenInterest.Delta15m, data.OpenInterest.Delta1h, data.OpenInterest.Delta4h,
+			data.OpenInterest.PriceDelta5m, data.OpenInterest.PriceDelta15m, data.OpenInterest.PriceDelta1h, data.OpenInterest.PriceDelta4h))
+	}
+
+	if data.Microstructure != nil {
+		sb.WriteString(fmt.Sprintf("Microstructure → CVD(1m/3m/15m): %.4f / %.4f / %.4f | OFI(1m/3m/15m): %.4f / %.4f / %.4f | OBI10: %.4f | MicroPrice: %.4f\n\n",
+			data.Microstructure.CVD1m, data.Microstructure.CVD3m, data.Microstructure.CVD15m,
+			data.Microstructure.OFI1m, data.Microstructure.OFI3m, data.Microstructure.OFI15m,
+			data.Microstructure.OBI10, data.Microstructure.MicroPrice))
+	}
 
 	if data.IntradaySeries != nil {
 		sb.WriteString("Intraday series (3‑minute intervals, oldest → latest):\n\n")
@@ -524,6 +889,209 @@ func formatFloatSlice(values []float64) string {
 		strValues[i] = fmt.Sprintf("%.3f", v)
 	}
 	return "[" + strings.Join(strValues, ", ") + "]"
+}
+
+type aggTrade struct {
+	Quantity     float64
+	Price        float64
+	BuyerIsMaker bool
+	Timestamp    int64
+}
+
+type orderBookSnapshot struct {
+	Bids [][2]float64
+	Asks [][2]float64
+}
+
+func getMicrostructureData(symbol string) *MicrostructureData {
+	data := &MicrostructureData{}
+
+	now := time.Now().UnixMilli()
+
+	if trades, err := getAggTrades(symbol, now-60*1000); err == nil {
+		data.CVD1m, data.OFI1m = aggregateFlow(trades)
+	}
+
+	if trades, err := getAggTrades(symbol, now-3*60*1000); err == nil {
+		data.CVD3m, data.OFI3m = aggregateFlow(trades)
+	}
+
+	if trades, err := getAggTrades(symbol, now-15*60*1000); err == nil {
+		data.CVD15m, data.OFI15m = aggregateFlow(trades)
+	}
+
+	if depth, err := getOrderBook(symbol, 10); err == nil {
+		data.OBI10 = calculateOrderBookImbalance(depth)
+		data.MicroPrice = calculateMicroPrice(depth)
+	}
+
+	return data
+}
+
+func getAggTrades(symbol string, startTime int64) ([]aggTrade, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/aggTrades?symbol=%s&startTime=%d&limit=1000", symbol, startTime)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw []struct {
+		Price        string `json:"p"`
+		Quantity     string `json:"q"`
+		BuyerIsMaker bool   `json:"m"`
+		Timestamp    int64  `json:"T"`
+	}
+
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	trades := make([]aggTrade, 0, len(raw))
+	for _, item := range raw {
+		qty, err := strconv.ParseFloat(item.Quantity, 64)
+		if err != nil {
+			continue
+		}
+		price, err := strconv.ParseFloat(item.Price, 64)
+		if err != nil {
+			continue
+		}
+		trades = append(trades, aggTrade{
+			Quantity:     qty,
+			Price:        price,
+			BuyerIsMaker: item.BuyerIsMaker,
+			Timestamp:    item.Timestamp,
+		})
+	}
+
+	sort.Slice(trades, func(i, j int) bool {
+		return trades[i].Timestamp < trades[j].Timestamp
+	})
+
+	return trades, nil
+}
+
+func aggregateFlow(trades []aggTrade) (float64, float64) {
+	if len(trades) == 0 {
+		return 0, 0
+	}
+
+	buyVol := 0.0
+	sellVol := 0.0
+	for _, t := range trades {
+		if t.BuyerIsMaker {
+			sellVol += t.Quantity
+		} else {
+			buyVol += t.Quantity
+		}
+	}
+
+	cvd := buyVol - sellVol
+	total := buyVol + sellVol
+	if total == 0 {
+		return cvd, 0
+	}
+
+	ofi := (buyVol - sellVol) / total
+	return cvd, ofi
+}
+
+func getOrderBook(symbol string, limit int) (*orderBookSnapshot, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/depth?symbol=%s&limit=%d", symbol, limit)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw struct {
+		Bids [][]string `json:"bids"`
+		Asks [][]string `json:"asks"`
+	}
+
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+
+	snapshot := &orderBookSnapshot{}
+	for _, bid := range raw.Bids {
+		if len(bid) < 2 {
+			continue
+		}
+		price, err1 := strconv.ParseFloat(bid[0], 64)
+		qty, err2 := strconv.ParseFloat(bid[1], 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		snapshot.Bids = append(snapshot.Bids, [2]float64{price, qty})
+	}
+
+	for _, ask := range raw.Asks {
+		if len(ask) < 2 {
+			continue
+		}
+		price, err1 := strconv.ParseFloat(ask[0], 64)
+		qty, err2 := strconv.ParseFloat(ask[1], 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		snapshot.Asks = append(snapshot.Asks, [2]float64{price, qty})
+	}
+
+	return snapshot, nil
+}
+
+func calculateOrderBookImbalance(book *orderBookSnapshot) float64 {
+	if book == nil || len(book.Bids) == 0 || len(book.Asks) == 0 {
+		return 0
+	}
+
+	maxDepth := len(book.Bids)
+	if len(book.Asks) < maxDepth {
+		maxDepth = len(book.Asks)
+	}
+
+	sumBids := 0.0
+	sumAsks := 0.0
+	for i := 0; i < maxDepth; i++ {
+		sumBids += book.Bids[i][1]
+		sumAsks += book.Asks[i][1]
+	}
+
+	total := sumBids + sumAsks
+	if total == 0 {
+		return 0
+	}
+
+	return (sumBids - sumAsks) / total
+}
+
+func calculateMicroPrice(book *orderBookSnapshot) float64 {
+	if book == nil || len(book.Bids) == 0 || len(book.Asks) == 0 {
+		return 0
+	}
+
+	bestBid := book.Bids[0]
+	bestAsk := book.Asks[0]
+	denom := bestBid[1] + bestAsk[1]
+	if denom == 0 {
+		return (bestBid[0] + bestAsk[0]) / 2
+	}
+
+	return (bestAsk[0]*bestBid[1] + bestBid[0]*bestAsk[1]) / denom
 }
 
 // Normalize 标准化symbol,确保是USDT交易对
