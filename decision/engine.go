@@ -248,14 +248,16 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("# 🎯 开仓标准（严格）\n\n")
 	sb.WriteString("只在**强信号**时开仓，不确定就观望。\n\n")
 	sb.WriteString("**你拥有的完整数据**：\n")
-	sb.WriteString("- 📊 **原始序列**：3分钟价格序列(MidPrices数组) + 4小时K线序列\n")
-	sb.WriteString("- 📈 **技术序列**：EMA20序列、MACD序列、RSI7序列、RSI14序列\n")
-	sb.WriteString("- 💰 **资金序列**：成交量序列、持仓量(OI)序列、资金费率\n")
-	sb.WriteString("- 🎯 **筛选标记**：AI500评分 / OI_Top排名（如果有标注）\n\n")
+	sb.WriteString("- 📊 **原始序列**：3分钟价格序列(MidPrices数组) 与 4小时K线序列保持时间对齐，可结合1分钟与15分钟聚合衍生，用于识别节奏与背景\n")
+	sb.WriteString("- 📈 **技术序列**：围绕1分钟脉冲、3分钟执行、15分钟共振、4小时背景的四层框架：RSI(7/14)在1分钟捕捉短期情绪极值与针刺行情，3分钟识别短势反转，15分钟验证动量共振并判断趋势延续，4小时奠定大趋势动能；MACD(12,26,9)规避1分钟噪声，在3分钟提前感知金叉/死叉与趋势拐点，15分钟确认趋势主轴，4小时刻画周期性边界；EMA20/60配合1分钟识别价稳支撑阻力、3分钟平衡短线动量、15分钟构筑趋势通道、4小时指引资金流方向；布林带宽度于1分钟侦测收口突破，3分钟追踪波动扩缩，15分钟甄别趋势阶段，4小时作为波动 regime 的背景参考；ATR与Realized Vol在3分钟估计波动率与止损尺度，15分钟观察波动 regime，4小时统筹杠杆风险并反向过滤1分钟噪声\n")
+	sb.WriteString("- 💰 **资金序列**：1分钟与3分钟成交量刻画Taker密度与放量节点，15分钟确认量能趋势，4小时标注资金流大框架；ΔOI×ΔPrice以四象限语言描述1分钟短期多空博弈、3分钟爆仓诱发点、15分钟主趋势拥挤度、4小时揭示大级别持仓结构；Funding Rate Skew（资金费率水平与斜率）在15分钟感知多空拥挤、3分钟过滤瞬时噪声、4小时辨识中期杠杆方向；CVD/OFI/VPIN在1分钟提供高频主动资金信号、3分钟确认微结构趋势、15分钟描绘资金动能背景，配合4小时资金节奏形成量价共振判断\n")
+	sb.WriteString("- 🧠 **盘口与微结构**：OBI与Micro-Price反映盘口失衡与公平价偏移，1分钟强化高频微结构信号、3分钟确认短势推进、15分钟延伸成动能脉络，4小时对齐宏观波段，并与Boll宽度、ATR、Realized Vol共同完成噪声过滤；同时支持Open Interest、Funding Rate Skew、成交量等跨周期共振洞察\n")
+	sb.WriteString("- 🎯 **筛选标记**：AI500评分 / OI_Top排名（如果有标注），作为多维评分参考\n\n")
 	sb.WriteString("**分析方法**（完全由你自主决定）：\n")
 	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、技术阻力位、斐波那契、波动带计算\n")
-	sb.WriteString("- 多维度交叉验证（价格+量+OI+指标+序列形态）\n")
-	sb.WriteString("- 用你认为最有效的方法发现高确定性机会\n")
+	sb.WriteString("- 在多周期共振框架下让1分钟/3分钟捕捉动能起点，15分钟确认趋势一致性，4小时提供方向锚点，必要时参考1小时做节奏过渡，主动执行噪声过滤，避免被单一周期误导\n")
+	sb.WriteString("- 多维度交叉验证（价格+量+OI+指标+序列形态），强调量价持仓一致性与波动结构自适应，无需固定阈值\n")
+	sb.WriteString("- 用你认为最有效的方法发现高确定性机会，允许等待以过滤噪声\n")
 	sb.WriteString("- 综合信心度 ≥ 75 才开仓\n\n")
 	sb.WriteString("**避免低质量信号**：\n")
 	sb.WriteString("- 单一维度（只看一个指标）\n")
@@ -365,6 +367,7 @@ func buildUserPrompt(ctx *Context) string {
 			// 使用FormatMarketData输出完整市场数据
 			if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
 				sb.WriteString(market.Format(marketData))
+				appendTimeframeStack(&sb, marketData)
 				sb.WriteString("\n")
 			}
 		}
@@ -392,6 +395,7 @@ func buildUserPrompt(ctx *Context) string {
 		// 使用FormatMarketData输出完整市场数据
 		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
 		sb.WriteString(market.Format(marketData))
+		appendTimeframeStack(&sb, marketData)
 		sb.WriteString("\n")
 	}
 	sb.WriteString("\n")
@@ -414,6 +418,64 @@ func buildUserPrompt(ctx *Context) string {
 	sb.WriteString("现在请分析并输出决策（思维链 + JSON）\n")
 
 	return sb.String()
+}
+
+func appendTimeframeStack(sb *strings.Builder, data *market.Data) {
+	if sb == nil || data == nil || len(data.Timeframes) == 0 {
+		return
+	}
+
+	sb.WriteString("**多周期指标栈（1m→3m→15m→4h，共振与噪声过滤）**:\n")
+
+	layers := []struct {
+		key     string
+		caption string
+	}{
+		{"1m", "1m 脉冲：短线情绪极值与噪声管理"},
+		{"3m", "3m 执行：核心节奏与量价共振"},
+		{"15m", "15m 过滤：趋势延续与波动阶段"},
+		{"4h", "4h 背景：宏观方向与风险锚点"},
+	}
+
+	for _, layer := range layers {
+		tf := data.Timeframes[layer.key]
+		if tf == nil {
+			continue
+		}
+
+		sb.WriteString(fmt.Sprintf("- %s → Close %.4f | RSI7/14 %.2f / %.2f | MACD %.4f | EMA20/60 %.4f / %.4f | BollWidth %.4f | ATR14 %.4f | RV20 %.4f | Vol %.2f (avg %.2f)\n",
+			layer.caption,
+			tf.Close,
+			tf.RSI7,
+			tf.RSI14,
+			tf.MACD,
+			tf.EMA20,
+			tf.EMA60,
+			tf.BollingerWidth,
+			tf.ATR14,
+			tf.RealizedVol20,
+			tf.CurrentVolume,
+			tf.AverageVolume,
+		))
+	}
+
+	if bridge := data.Timeframes["1h"]; bridge != nil {
+		sb.WriteString(fmt.Sprintf("- 1h 过渡：衔接3m执行与4h背景 → Close %.4f | RSI7/14 %.2f / %.2f | MACD %.4f | EMA20/60 %.4f / %.4f | BollWidth %.4f | ATR14 %.4f | RV20 %.4f | Vol %.2f (avg %.2f)\n",
+			bridge.Close,
+			bridge.RSI7,
+			bridge.RSI14,
+			bridge.MACD,
+			bridge.EMA20,
+			bridge.EMA60,
+			bridge.BollingerWidth,
+			bridge.ATR14,
+			bridge.RealizedVol20,
+			bridge.CurrentVolume,
+			bridge.AverageVolume,
+		))
+	}
+
+	sb.WriteString("\n")
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
